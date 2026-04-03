@@ -1,9 +1,15 @@
 /*
- * main.c - Efficient E1x Chango test harness
+ * main.c - Efficient E1x Chango main loop
  *
- * Runs the chango pipeline: image → pixelate → synthesize → audio output.
- * Writes raw 16-bit signed PCM to chango_output.raw.
- * Play with: play -t raw -r 8000 -e signed -b 16 -c 1 chango_output.raw
+ * Runs the chango pipeline in a frame loop:
+ *   camera.capture() → pixelate() → synthesize() → audio_out.write()
+ *
+ * Camera and audio output are abstracted behind interfaces (camera.h,
+ * audio_out.h) so hardware drivers can be swapped in later. Currently
+ * uses software-in-the-loop implementations (test image + file output).
+ *
+ * Play output with:
+ *   play -t raw -r 8000 -e signed -b 16 -c 1 chango_output.raw
  */
 
 #include <stdint.h>
@@ -26,6 +32,9 @@
 #include "chango_data.h"
 #endif
 
+#include "camera.h"
+#include "audio_out.h"
+
 /* Kernel declarations */
 void pixelate(const uint8_t *restrict image,
               int width, int height,
@@ -40,55 +49,98 @@ void synthesize(const uint8_t *restrict intensities,
                 int16_t *restrict audio_out,
                 int num_samples);
 
+/*
+ * Audio samples per frame. At 8000 Hz sample rate and ~30 fps,
+ * each frame produces ~267 samples. We use 256 for alignment.
+ */
+#define SAMPLES_PER_FRAME 256
+
+/* Total frames to render (SWIL mode). 2 seconds = 8000/256 ≈ 31 frames. */
+#define NUM_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
+
 /* Buffers */
 uint8_t intensities[NUM_TONES];
 uint32_t phases[NUM_TONES];
-int16_t audio_out[NUM_AUDIO_SAMPLES];
+int16_t audio_buf[SAMPLES_PER_FRAME];
 
 #define OUTPUT_FILE "chango_output.raw"
 
 int main() {
-    /* Zero phase accumulators */
-    memset(phases, 0, sizeof(phases));
-
     /* Prevent constant propagation of inputs */
     stop_propagation_u8((uint8_t *)test_image, IMG_WIDTH * IMG_HEIGHT);
     stop_propagation_i16((int16_t *)sine_table, SINE_TABLE_SIZE);
 
-    /* Step 1: Pixelate - compute average intensity per region */
-    enterProfileRegion("pixelate");
-    pixelate(test_image, IMG_WIDTH, IMG_HEIGHT,
-             NUM_GRID_X, NUM_GRID_Y, intensities);
-    exitProfileRegion();
-
-    /* Print intensity grid for debugging */
-    printf("[chango] Intensity grid (%dx%d):\n", NUM_GRID_X, NUM_GRID_Y);
-    for (int y = 0; y < NUM_GRID_Y; y++) {
-        printf("  ");
-        for (int x = 0; x < NUM_GRID_X; x++) {
-            printf("%3d ", intensities[x * NUM_GRID_Y + y]);
-        }
-        printf("\n");
-    }
-
-    /* Step 2: Synthesize audio */
-    enterProfileRegion("synthesize");
-    synthesize(intensities, NUM_TONES, sine_table, phase_incs,
-               phases, audio_out, NUM_AUDIO_SAMPLES);
-    exitProfileRegion();
-
-    /* Step 3: Write raw PCM to file (not stdout, to avoid stderr contamination) */
-    FILE *fp = fopen(OUTPUT_FILE, "wb");
-    if (!fp) {
-        printf("[chango] FAIL - could not open %s\n", OUTPUT_FILE);
+    /* Set up camera (software-in-the-loop: returns test image) */
+    camera_t cam = camera_swil_create(test_image, IMG_WIDTH, IMG_HEIGHT);
+    if (cam.init(&cam) != 0) {
+        printf("[chango] FAIL - camera init\n");
         return 1;
     }
-    fwrite(audio_out, sizeof(int16_t), NUM_AUDIO_SAMPLES, fp);
-    fclose(fp);
+
+    /* Set up audio output (software-in-the-loop: writes to file) */
+    audio_out_t ao = audio_out_swil_create(OUTPUT_FILE, SAMPLE_RATE);
+    if (ao.init(&ao) != 0) {
+        printf("[chango] FAIL - audio output init\n");
+        cam.shutdown(&cam);
+        return 1;
+    }
+
+    /* Zero phase accumulators */
+    memset(phases, 0, sizeof(phases));
+
+    printf("[chango] Starting: %d frames, %d samples/frame, %d Hz\n",
+           NUM_FRAMES, SAMPLES_PER_FRAME, SAMPLE_RATE);
+
+    int total_samples = 0;
+
+    for (int frame = 0; frame < NUM_FRAMES; frame++) {
+        /* Capture a frame */
+        const uint8_t *image = cam.capture(&cam);
+        if (!image) {
+            printf("[chango] FAIL - camera capture at frame %d\n", frame);
+            break;
+        }
+
+        /* Pixelate: image → intensity grid */
+        enterProfileRegion("pixelate");
+        pixelate(image, cam.width, cam.height,
+                 NUM_GRID_X, NUM_GRID_Y, intensities);
+        exitProfileRegion();
+
+        /* Print intensity grid on first frame */
+        if (frame == 0) {
+            printf("[chango] Intensity grid (%dx%d):\n", NUM_GRID_X, NUM_GRID_Y);
+            for (int y = 0; y < NUM_GRID_Y; y++) {
+                printf("  ");
+                for (int x = 0; x < NUM_GRID_X; x++) {
+                    printf("%3d ", intensities[x * NUM_GRID_Y + y]);
+                }
+                printf("\n");
+            }
+        }
+
+        /* Synthesize: intensities → audio chunk (phases persist across frames) */
+        enterProfileRegion("synthesize");
+        synthesize(intensities, NUM_TONES, sine_table, phase_incs,
+                   phases, audio_buf, SAMPLES_PER_FRAME);
+        exitProfileRegion();
+
+        /* Push audio chunk to output */
+        if (ao.write(&ao, audio_buf, SAMPLES_PER_FRAME) != 0) {
+            printf("[chango] FAIL - audio write at frame %d\n", frame);
+            break;
+        }
+
+        total_samples += SAMPLES_PER_FRAME;
+    }
+
+    /* Shut down */
+    ao.shutdown(&ao);
+    cam.shutdown(&cam);
 
     printf("[chango] Wrote %s: %d samples (%d Hz, %.1f seconds)\n",
-           OUTPUT_FILE, NUM_AUDIO_SAMPLES, SAMPLE_RATE,
-           (float)NUM_AUDIO_SAMPLES / SAMPLE_RATE);
+           OUTPUT_FILE, total_samples, SAMPLE_RATE,
+           (float)total_samples / SAMPLE_RATE);
     printf("[chango] Play with: play -t raw -r %d -e signed -b 16 -c 1 %s\n",
            SAMPLE_RATE, OUTPUT_FILE);
     printf("[chango] PASS\n");

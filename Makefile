@@ -15,7 +15,7 @@ STOPPROP_INC = /home/blucia/cvsandbox/apps/include
 INCLUDES = -I$(SDK_INC) -I$(STOPPROP_INC) -I.
 CFLAGS = -O3 $(INCLUDES)
 
-SOURCES = main.c chango.c
+SOURCES = main.c chango.c camera_swil.c audio_out_swil.c
 DATA = chango_data.h.inc
 
 .PHONY: all sim native fabric data play clean
@@ -31,22 +31,30 @@ $(DATA): gen_data.py
 # Simulation build (runs on host, simulates E1x)
 sim: chango_sim
 
-chango_sim: $(SOURCES) $(DATA)
-	$(EFFCC) --sim -c $(CFLAGS) -DEFF_ARCH_E1X -DSIM_BUILD -flto -o chango.sim.o chango.c
-	$(EFFCC) --sim -c $(CFLAGS) -DEFF_ARCH_E1X -DSIM_BUILD -flto -o main.sim.o main.c
-	$(EFFCC) --sim -o $@ chango.sim.o main.sim.o -DEFF_ARCH_E1X --target=monaco -flto -fuse-ld=lld
+SIM_FLAGS = --sim -c $(CFLAGS) -DEFF_ARCH_E1X -DSIM_BUILD -flto
+
+chango_sim: $(SOURCES) $(DATA) camera.h audio_out.h
+	$(EFFCC) $(SIM_FLAGS) -o chango.sim.o chango.c
+	$(EFFCC) $(SIM_FLAGS) -o camera_swil.sim.o camera_swil.c
+	$(EFFCC) $(SIM_FLAGS) -o audio_out_swil.sim.o audio_out_swil.c
+	$(EFFCC) $(SIM_FLAGS) -o main.sim.o main.c
+	$(EFFCC) --sim -o $@ chango.sim.o camera_swil.sim.o audio_out_swil.sim.o main.sim.o -DEFF_ARCH_E1X --target=monaco -flto -fuse-ld=lld
 
 # Fabric build (for actual E1x hardware)
 fabric: chango_fabric
 
-chango_fabric: $(SOURCES) $(DATA)
-	$(EFFCC) -c $(CFLAGS) -DEFF_ARCH_E1X -DHW_BUILD -flto --target=monaco -o chango.fab.o chango.c
-	$(EFFCC) -c $(CFLAGS) -DEFF_ARCH_E1X -DHW_BUILD -flto --target=monaco -o main.fab.o main.c
-	$(EFFCC) -o $@ chango.fab.o main.fab.o -DEFF_ARCH_E1X -DHW_BUILD -flto --target=monaco -Wl,--gc-sections
+FAB_FLAGS = -c $(CFLAGS) -DEFF_ARCH_E1X -DHW_BUILD -flto --target=monaco
 
-# Run sim and play audio via SoX
+chango_fabric: $(SOURCES) $(DATA) camera.h audio_out.h
+	$(EFFCC) $(FAB_FLAGS) -o chango.fab.o chango.c
+	$(EFFCC) $(FAB_FLAGS) -o camera_swil.fab.o camera_swil.c
+	$(EFFCC) $(FAB_FLAGS) -o audio_out_swil.fab.o audio_out_swil.c
+	$(EFFCC) $(FAB_FLAGS) -o main.fab.o main.c
+	$(EFFCC) -o $@ chango.fab.o camera_swil.fab.o audio_out_swil.fab.o main.fab.o -DEFF_ARCH_E1X -DHW_BUILD -flto --target=monaco -Wl,--gc-sections
+
+# Run sim, extract audio from printf output, and play via SoX
 play: chango_sim
-	./chango_sim
+	./chango_sim | python3 uart_to_raw.py > chango_output.raw
 	play -t raw -r 8000 -e signed -b 16 -c 1 chango_output.raw
 
 clean:
