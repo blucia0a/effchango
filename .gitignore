@@ -1,0 +1,6 @@
+*.o
+chango_sim
+chango_fabric
+chango_output.raw
+chango_data.h.inc
+chango_stderr.txt
