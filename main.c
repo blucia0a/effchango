@@ -49,6 +49,13 @@ void synthesize(const uint8_t *restrict intensities,
                 int16_t *restrict audio_out,
                 int num_samples);
 
+void lowpass(const int16_t *restrict input,
+             int16_t *restrict output,
+             int length,
+             int32_t b0, int32_t b1, int32_t b2,
+             int32_t a1, int32_t a2,
+             int32_t *restrict state);
+
 /*
  * Audio samples per frame. At 8000 Hz sample rate and ~30 fps,
  * each frame produces ~267 samples. We use 256 for alignment.
@@ -58,10 +65,19 @@ void synthesize(const uint8_t *restrict intensities,
 /* Total frames to render (SWIL mode). 2 seconds = 8000/256 ≈ 31 frames. */
 #define NUM_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
 
+/*
+ * Default LPF settings. Cutoff index 10/15 ≈ mid-high, Q index 2/7 ≈ moderate.
+ * These can be overridden at runtime by sensors or other control signals.
+ */
+#define DEFAULT_LPF_CUTOFF_IDX 10
+#define DEFAULT_LPF_Q_IDX 2
+
 /* Buffers */
 uint8_t intensities[NUM_TONES];
 uint32_t phases[NUM_TONES];
 int16_t audio_buf[SAMPLES_PER_FRAME];
+int16_t filtered_buf[SAMPLES_PER_FRAME];
+int32_t lpf_state[4]; /* {x1, x2, y1, y2} */
 
 #define OUTPUT_FILE "chango_output.raw"
 
@@ -85,11 +101,24 @@ int main() {
         return 1;
     }
 
-    /* Zero phase accumulators */
+    /* Zero phase accumulators and filter state */
     memset(phases, 0, sizeof(phases));
+    memset(lpf_state, 0, sizeof(lpf_state));
+
+    /* Look up LPF coefficients from precomputed table */
+    int lpf_cutoff_idx = DEFAULT_LPF_CUTOFF_IDX;
+    int lpf_q_idx = DEFAULT_LPF_Q_IDX;
+    int lpf_offset = (lpf_cutoff_idx * NUM_LPF_RESONANCES + lpf_q_idx) * LPF_COEFFS_PER_ENTRY;
+    int32_t lpf_b0 = lpf_coeffs[lpf_offset + 0];
+    int32_t lpf_b1 = lpf_coeffs[lpf_offset + 1];
+    int32_t lpf_b2 = lpf_coeffs[lpf_offset + 2];
+    int32_t lpf_a1 = lpf_coeffs[lpf_offset + 3];
+    int32_t lpf_a2 = lpf_coeffs[lpf_offset + 4];
 
     printf("[chango] Starting: %d frames, %d samples/frame, %d Hz\n",
            NUM_FRAMES, SAMPLES_PER_FRAME, SAMPLE_RATE);
+    printf("[chango] LPF: cutoff_idx=%d, q_idx=%d, coeffs=[%d,%d,%d,%d,%d]\n",
+           lpf_cutoff_idx, lpf_q_idx, lpf_b0, lpf_b1, lpf_b2, lpf_a1, lpf_a2);
 
     int total_samples = 0;
 
@@ -125,8 +154,14 @@ int main() {
                    phases, audio_buf, SAMPLES_PER_FRAME);
         exitProfileRegion();
 
-        /* Push audio chunk to output */
-        if (ao.write(&ao, audio_buf, SAMPLES_PER_FRAME) != 0) {
+        /* Low-pass filter (state persists across frames) */
+        enterProfileRegion("lowpass");
+        lowpass(audio_buf, filtered_buf, SAMPLES_PER_FRAME,
+                lpf_b0, lpf_b1, lpf_b2, lpf_a1, lpf_a2, lpf_state);
+        exitProfileRegion();
+
+        /* Push filtered audio chunk to output */
+        if (ao.write(&ao, filtered_buf, SAMPLES_PER_FRAME) != 0) {
             printf("[chango] FAIL - audio write at frame %d\n", frame);
             break;
         }

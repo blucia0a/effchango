@@ -6,6 +6,7 @@
  * 2. Computing average pixel intensity per region
  * 3. Using intensity as amplitude for a sine tone per region
  * 4. Mixing all tones into a single audio stream
+ * 5. Applying a parameterized biquad low-pass filter
  *
  * All integer arithmetic - no floating point.
  * Based on PhotoChango by Brandon Lucia (2011-2012).
@@ -13,6 +14,9 @@
 
 #include <stdint.h>
 #include <test_common.h>
+
+#define FRAC_BITS 15
+#define FIXED_ROUND(x) (((x) + (1 << (FRAC_BITS - 1))) >> FRAC_BITS)
 
 /*
  * pixelate: Divide image into grid regions and compute average intensity.
@@ -97,4 +101,51 @@ __efficient__ void synthesize(const uint8_t *restrict intensities,
 
         audio_out[s] = (int16_t)mix;
     }
+}
+
+/*
+ * lowpass: Biquad low-pass filter (Direct Form I), Q15 fixed-point.
+ *
+ * Filters audio in-place using precomputed Q15 coefficients.
+ * Filter state persists across calls via the state array.
+ *
+ * input:       input sample buffer (16-bit signed PCM)
+ * output:      output sample buffer (may alias input for in-place)
+ * length:      number of samples
+ * b0, b1, b2:  feedforward coefficients (Q15)
+ * a1, a2:      feedback coefficients (Q15, already negated in table)
+ * state:       4-element array {x1, x2, y1, y2}, persists across calls
+ */
+__efficient__ void lowpass(const int16_t *restrict input,
+                           int16_t *restrict output,
+                           int length,
+                           int32_t b0, int32_t b1, int32_t b2,
+                           int32_t a1, int32_t a2,
+                           int32_t *restrict state) {
+    int32_t x1 = state[0];
+    int32_t x2 = state[1];
+    int32_t y1 = state[2];
+    int32_t y2 = state[3];
+
+    for (int n = 0; n < length; n++) {
+        int32_t x = input[n];
+        int32_t acc = x * b0 + x1 * b1 + x2 * b2 - y1 * a1 - y2 * a2;
+        int32_t y = FIXED_ROUND(acc);
+
+        /* Clamp to int16_t range */
+        if (y > 32767) y = 32767;
+        if (y < -32767) y = -32767;
+
+        output[n] = (int16_t)y;
+
+        x2 = x1;
+        x1 = x;
+        y2 = y1;
+        y1 = y;
+    }
+
+    state[0] = x1;
+    state[1] = x2;
+    state[2] = y1;
+    state[3] = y2;
 }
