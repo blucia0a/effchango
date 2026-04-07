@@ -34,6 +34,7 @@
 
 #include "camera.h"
 #include "audio_out.h"
+#include "imu.h"
 
 /* Kernel declarations */
 void pixelate(const uint8_t *restrict image,
@@ -65,12 +66,8 @@ void lowpass(const int16_t *restrict input,
 /* Total frames to render (SWIL mode). 2 seconds = 8000/256 ≈ 31 frames. */
 #define NUM_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
 
-/*
- * Default LPF settings. Cutoff index 10/15 ≈ mid-high, Q index 2/7 ≈ moderate.
- * These can be overridden at runtime by sensors or other control signals.
- */
-#define DEFAULT_LPF_CUTOFF_IDX 10
-#define DEFAULT_LPF_Q_IDX 2
+/* IMU sweep period in frames. One full tilt cycle over the entire render. */
+#define IMU_SWEEP_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
 
 /* Buffers */
 uint8_t intensities[NUM_TONES];
@@ -93,10 +90,19 @@ int main() {
         return 1;
     }
 
-    /* Set up audio output (software-in-the-loop: writes to file) */
+    /* Set up audio output (software-in-the-loop: prints over UART) */
     audio_out_t ao = audio_out_swil_create(OUTPUT_FILE, SAMPLE_RATE);
     if (ao.init(&ao) != 0) {
         printf("[chango] FAIL - audio output init\n");
+        cam.shutdown(&cam);
+        return 1;
+    }
+
+    /* Set up IMU (software-in-the-loop: synthetic sweep) */
+    imu_t imu = imu_swil_create(IMU_SWEEP_FRAMES);
+    if (imu.init(&imu) != 0) {
+        printf("[chango] FAIL - imu init\n");
+        ao.shutdown(&ao);
         cam.shutdown(&cam);
         return 1;
     }
@@ -105,20 +111,8 @@ int main() {
     memset(phases, 0, sizeof(phases));
     memset(lpf_state, 0, sizeof(lpf_state));
 
-    /* Look up LPF coefficients from precomputed table */
-    int lpf_cutoff_idx = DEFAULT_LPF_CUTOFF_IDX;
-    int lpf_q_idx = DEFAULT_LPF_Q_IDX;
-    int lpf_offset = (lpf_cutoff_idx * NUM_LPF_RESONANCES + lpf_q_idx) * LPF_COEFFS_PER_ENTRY;
-    int32_t lpf_b0 = lpf_coeffs[lpf_offset + 0];
-    int32_t lpf_b1 = lpf_coeffs[lpf_offset + 1];
-    int32_t lpf_b2 = lpf_coeffs[lpf_offset + 2];
-    int32_t lpf_a1 = lpf_coeffs[lpf_offset + 3];
-    int32_t lpf_a2 = lpf_coeffs[lpf_offset + 4];
-
     printf("[chango] Starting: %d frames, %d samples/frame, %d Hz\n",
            NUM_FRAMES, SAMPLES_PER_FRAME, SAMPLE_RATE);
-    printf("[chango] LPF: cutoff_idx=%d, q_idx=%d, coeffs=[%d,%d,%d,%d,%d]\n",
-           lpf_cutoff_idx, lpf_q_idx, lpf_b0, lpf_b1, lpf_b2, lpf_a1, lpf_a2);
 
     int total_samples = 0;
 
@@ -148,13 +142,35 @@ int main() {
             }
         }
 
+        /* Read IMU and map to LPF parameters */
+        imu_sample_t imu_sample;
+        imu.read(&imu, &imu_sample);
+
+        /*
+         * Map accel_x (-1000..+1000) → cutoff index (0..NUM_LPF_CUTOFFS-1)
+         * Map accel_y (-1000..+1000) → resonance index (0..NUM_LPF_RESONANCES-1)
+         */
+        int lpf_cutoff_idx = ((int)imu_sample.accel_x + 1000) * (NUM_LPF_CUTOFFS - 1) / 2000;
+        int lpf_q_idx = ((int)imu_sample.accel_y + 1000) * (NUM_LPF_RESONANCES - 1) / 2000;
+        if (lpf_cutoff_idx < 0) lpf_cutoff_idx = 0;
+        if (lpf_cutoff_idx >= NUM_LPF_CUTOFFS) lpf_cutoff_idx = NUM_LPF_CUTOFFS - 1;
+        if (lpf_q_idx < 0) lpf_q_idx = 0;
+        if (lpf_q_idx >= NUM_LPF_RESONANCES) lpf_q_idx = NUM_LPF_RESONANCES - 1;
+
+        int lpf_offset = (lpf_cutoff_idx * NUM_LPF_RESONANCES + lpf_q_idx) * LPF_COEFFS_PER_ENTRY;
+        int32_t lpf_b0 = lpf_coeffs[lpf_offset + 0];
+        int32_t lpf_b1 = lpf_coeffs[lpf_offset + 1];
+        int32_t lpf_b2 = lpf_coeffs[lpf_offset + 2];
+        int32_t lpf_a1 = lpf_coeffs[lpf_offset + 3];
+        int32_t lpf_a2 = lpf_coeffs[lpf_offset + 4];
+
         /* Synthesize: intensities → audio chunk (phases persist across frames) */
         enterProfileRegion("synthesize");
         synthesize(intensities, NUM_TONES, sine_table, phase_incs,
                    phases, audio_buf, SAMPLES_PER_FRAME);
         exitProfileRegion();
 
-        /* Low-pass filter (state persists across frames) */
+        /* Low-pass filter (state persists across frames, coeffs update per frame) */
         enterProfileRegion("lowpass");
         lowpass(audio_buf, filtered_buf, SAMPLES_PER_FRAME,
                 lpf_b0, lpf_b1, lpf_b2, lpf_a1, lpf_a2, lpf_state);
@@ -170,6 +186,7 @@ int main() {
     }
 
     /* Shut down */
+    imu.shutdown(&imu);
     ao.shutdown(&ao);
     cam.shutdown(&cam);
 

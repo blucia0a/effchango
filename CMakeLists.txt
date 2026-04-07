@@ -9,7 +9,7 @@ add_eff_app(chango
     ARCHS all
     TARGETS fabric sim scalar native
     SOURCE
-        main.c chango.c camera_swil.c audio_out_swil.c
+        main.c chango.c camera_swil.c audio_out_swil.c imu_swil.c
         chango_data.h.inc
 )
 
