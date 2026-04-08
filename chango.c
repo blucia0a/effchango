@@ -45,8 +45,15 @@ __efficient__ void pixelate(const uint8_t *restrict image,
             int x_start = rx * region_w;
 
             for (int y = y_start; y < y_start + region_h; y++) {
-                for (int x = x_start; x < x_start + region_w; x++) {
-                    sum += image[y * width + x];
+                /* Row pointer avoids recomputing y*width each pixel */
+                const uint8_t *row = &image[y * width + x_start];
+
+                /* Unrolled by 4 — region_w (8) is a multiple of 4 */
+                for (int x = 0; x < region_w; x += 4) {
+                    sum += row[x + 0];
+                    sum += row[x + 1];
+                    sum += row[x + 2];
+                    sum += row[x + 3];
                 }
             }
 
@@ -98,17 +105,8 @@ __efficient__ void synthesize(const uint8_t *restrict intensities,
             phases[t] += phase_incs[t];
         }
 
-        /*
-         * Average across all tones using two-step multiply-shift.
-         * Divide by 100 = divide by 4, then by 25:
-         *   (mix >> 2) * 1311 >> 15
-         * This stays within int32 range (max ~1.07 billion).
-         * inv_num_tones and inv_shift are unused now but kept in the
-         * signature for future flexibility with non-100 tone counts.
-         */
-        (void)inv_num_tones;
-        (void)inv_shift;
-        mix = ((mix >> 2) * 1311) >> 15;
+        /* Average across all tones: x / 25 ≈ (x * 1311) >> 15 */
+        mix = (mix * inv_num_tones) >> inv_shift;
 
         /* Clamp to int16_t range */
         if (mix > 32767) mix = 32767;

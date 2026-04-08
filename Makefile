@@ -90,7 +90,7 @@ chango_fabric: $(SOURCES) $(DATA) $(HEADERS) $(LIBEFF)
 	$(EFFCC) -o $@ \
 		chango.fab.o camera_swil.fab.o audio_out_swil.fab.o imu_swil.fab.o main.fab.o \
 		-Wl,--whole-archive $(SDK_LIBS) -Wl,--no-whole-archive \
-		-DEFF_ARCH_E1X $(STDIO_OPTS) -flto --target=e1x -Wl,--gc-sections -Wl,--allow-multiple-definition
+		-DEFF_ARCH_E1X $(STDIO_OPTS) -flto --target=e1x -Wl,--allow-multiple-definition
 	objcopy -Overilog $@ $@.hex
 
 # Fabric build with PnR visualization (generates SVGs from placed-and-routed MLIR)

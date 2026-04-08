@@ -63,7 +63,7 @@ void lowpass(const int16_t *restrict input,
  * Audio samples per frame. At 8000 Hz sample rate and ~30 fps,
  * each frame produces ~267 samples. We use 256 for alignment.
  */
-#define SAMPLES_PER_FRAME 1024
+#define SAMPLES_PER_FRAME 512
 
 /* Total frames to render (SWIL mode). 2 seconds = 8000/256 ≈ 31 frames. */
 #define NUM_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
@@ -75,17 +75,17 @@ void lowpass(const int16_t *restrict input,
  * Precomputed constants to avoid division on the fabric.
  *
  * For pixelate: region is (IMG_WIDTH/NUM_GRID_X) x (IMG_HEIGHT/NUM_GRID_Y)
- *   40/10 = 4, so 4x4 = 16 pixels per region, region_shift = 4
+ *   40/5 = 8, so 8x8 = 64 pixels per region, region_shift = 6
  *
- * For synthesize: divide by NUM_TONES (100) via multiply-shift.
- *   x / 100 ≈ (x * 5243) >> 19   (error < 0.001%)
+ * For synthesize: divide by NUM_TONES (25) via multiply-shift.
+ *   x / 25 ≈ (x * 1311) >> 15
  */
 #define REGION_W (IMG_WIDTH / NUM_GRID_X)
 #define REGION_H (IMG_HEIGHT / NUM_GRID_Y)
-#define REGION_SHIFT 4   /* log2(REGION_W * REGION_H) = log2(16) = 4 */
+#define REGION_SHIFT 6   /* log2(REGION_W * REGION_H) = log2(64) = 6 */
 
-#define INV_NUM_TONES 5243   /* ceil(2^19 / 100) */
-#define INV_SHIFT 19
+#define INV_NUM_TONES 1311   /* ceil(2^15 / 25) */
+#define INV_SHIFT 15
 
 /* Buffers */
 uint8_t intensities[NUM_TONES];

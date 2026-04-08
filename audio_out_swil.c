@@ -1,21 +1,23 @@
 /*
- * audio_out_swil.c - Software-in-the-loop audio output over printf/UART
+ * audio_out_swil.c - Software-in-the-loop audio output over UART
  *
- * Prints samples as decimal integers over printf (routed to UART on E1x).
- * Framed with markers so a host-side script can extract the audio:
+ * Sends raw int16 little-endian PCM bytes directly to UART.
+ * No text framing — the byte stream IS the audio.
  *
- *   CHANGO_AUDIO_START <sample_rate>
- *   <sample0>
- *   <sample1>
- *   ...
- *   CHANGO_AUDIO_END
- *
- * On the host, capture UART output and run:
- *   python3 uart_to_raw.py < uart_log.txt | play -t raw -r 8000 -e signed -b 16 -c 1 -
+ * On hardware:
+ *   cat /dev/ttyUSB0 | play -t raw -r 8000 -e signed -b 16 -c 1 -
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include "audio_out.h"
+
+#if defined(EFF_ARCH_E1X) && !defined(SIM_BUILD)
+#include <eff.h>
+#define UART_BYTE(b) eff_uart_putc(STDIO_UART, (char)(b))
+#else
+#define UART_BYTE(b) putchar((b))
+#endif
 
 typedef struct {
     int total_samples;
@@ -26,14 +28,15 @@ static audio_out_swil_ctx_t swil_ctx;
 static int swil_init(audio_out_t *ao) {
     audio_out_swil_ctx_t *ctx = (audio_out_swil_ctx_t *)ao->ctx;
     ctx->total_samples = 0;
-    printf("CHANGO_AUDIO_START %d\n", ao->sample_rate);
     return 0;
 }
 
 static int swil_write(audio_out_t *ao, const int16_t *samples, int num_samples) {
     audio_out_swil_ctx_t *ctx = (audio_out_swil_ctx_t *)ao->ctx;
     for (int i = 0; i < num_samples; i++) {
-        printf("%d\n", (int)samples[i]);
+        uint16_t val = (uint16_t)samples[i];
+        UART_BYTE(val & 0xFF);
+        UART_BYTE((val >> 8) & 0xFF);
     }
     ctx->total_samples += num_samples;
     return 0;
@@ -41,11 +44,10 @@ static int swil_write(audio_out_t *ao, const int16_t *samples, int num_samples) 
 
 static void swil_shutdown(audio_out_t *ao) {
     (void)ao;
-    printf("CHANGO_AUDIO_END\n");
 }
 
 audio_out_t audio_out_swil_create(const char *filename, int sample_rate) {
-    (void)filename; /* not used — output goes to printf/UART */
+    (void)filename;
     swil_ctx.total_samples = 0;
 
     audio_out_t ao;
