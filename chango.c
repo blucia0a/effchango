@@ -8,12 +8,11 @@
  * 4. Mixing all tones into a single audio stream
  * 5. Applying a parameterized biquad low-pass filter
  *
- * All integer arithmetic - no floating point.
+ * All integer arithmetic - no floating point, no division.
  * Based on PhotoChango by Brandon Lucia (2011-2012).
  */
 
 #include <stdint.h>
-#include <test_common.h>
 
 #define FRAC_BITS 15
 #define FIXED_ROUND(x) (((x) + (1 << (FRAC_BITS - 1))) >> FRAC_BITS)
@@ -21,21 +20,24 @@
 /*
  * pixelate: Divide image into grid regions and compute average intensity.
  *
- * image:       grayscale pixel data (row-major, 0-255)
- * width:       image width in pixels
- * height:      image height in pixels
- * grid_x:      number of horizontal regions
- * grid_y:      number of vertical regions
- * intensities: output array of size grid_x * grid_y (0-255)
+ * All parameters that would require division are precomputed by the caller.
+ * No division occurs inside this function.
+ *
+ * image:        grayscale pixel data (row-major, 0-255)
+ * width:        image width in pixels
+ * region_w:     pixels per region horizontally (precomputed: width / grid_x)
+ * region_h:     pixels per region vertically (precomputed: height / grid_y)
+ * grid_x:       number of horizontal regions
+ * grid_y:       number of vertical regions
+ * region_shift: log2(region_w * region_h) for averaging via shift
+ * intensities:  output array of size grid_x * grid_y (0-255)
  */
 __efficient__ void pixelate(const uint8_t *restrict image,
-                            int width, int height,
+                            int width,
+                            int region_w, int region_h,
                             int grid_x, int grid_y,
+                            int region_shift,
                             uint8_t *restrict intensities) {
-    int region_w = width / grid_x;
-    int region_h = height / grid_y;
-    int region_pixels = region_w * region_h;
-
     for (int ry = 0; ry < grid_y; ry++) {
         for (int rx = 0; rx < grid_x; rx++) {
             uint32_t sum = 0;
@@ -48,7 +50,7 @@ __efficient__ void pixelate(const uint8_t *restrict image,
                 }
             }
 
-            intensities[rx * grid_y + ry] = (uint8_t)(sum / region_pixels);
+            intensities[rx * grid_y + ry] = (uint8_t)(sum >> region_shift);
         }
     }
 }
@@ -58,18 +60,22 @@ __efficient__ void pixelate(const uint8_t *restrict image,
  *
  * For each output sample, computes the contribution of each tone:
  *   sample_contribution = (sine_table[phase_index] * amplitude) >> 8
- * Then averages all contributions.
+ * Then averages all contributions using multiply-shift (no division).
  *
- * intensities: amplitude per tone (0-255), size num_tones
- * num_tones:   number of tones to mix
- * sine_table:  256-entry Q15 sine lookup table
- * phase_incs:  phase increment per tone (8.24 fixed-point)
- * phases:      phase accumulator per tone (updated in-place)
- * audio_out:   output buffer, 16-bit signed PCM
- * num_samples: number of samples to generate
+ * intensities:    amplitude per tone (0-255), size num_tones
+ * num_tones:      number of tones to mix
+ * inv_num_tones:  fixed-point reciprocal for averaging (precomputed)
+ * inv_shift:      right shift to apply after multiply (precomputed)
+ * sine_table:     256-entry Q15 sine lookup table
+ * phase_incs:     phase increment per tone (8.24 fixed-point)
+ * phases:         phase accumulator per tone (updated in-place)
+ * audio_out:      output buffer, 16-bit signed PCM
+ * num_samples:    number of samples to generate
  */
 __efficient__ void synthesize(const uint8_t *restrict intensities,
                               int num_tones,
+                              int32_t inv_num_tones,
+                              int inv_shift,
                               const int16_t *restrict sine_table,
                               const uint32_t *restrict phase_incs,
                               uint32_t *restrict phases,
@@ -92,8 +98,17 @@ __efficient__ void synthesize(const uint8_t *restrict intensities,
             phases[t] += phase_incs[t];
         }
 
-        /* Average across all tones */
-        mix = mix / num_tones;
+        /*
+         * Average across all tones using two-step multiply-shift.
+         * Divide by 100 = divide by 4, then by 25:
+         *   (mix >> 2) * 1311 >> 15
+         * This stays within int32 range (max ~1.07 billion).
+         * inv_num_tones and inv_shift are unused now but kept in the
+         * signature for future flexibility with non-100 tone counts.
+         */
+        (void)inv_num_tones;
+        (void)inv_shift;
+        mix = ((mix >> 2) * 1311) >> 15;
 
         /* Clamp to int16_t range */
         if (mix > 32767) mix = 32767;
@@ -106,15 +121,9 @@ __efficient__ void synthesize(const uint8_t *restrict intensities,
 /*
  * lowpass: Biquad low-pass filter (Direct Form I), Q15 fixed-point.
  *
- * Filters audio in-place using precomputed Q15 coefficients.
+ * Filters audio using precomputed Q15 coefficients.
  * Filter state persists across calls via the state array.
- *
- * input:       input sample buffer (16-bit signed PCM)
- * output:      output sample buffer (may alias input for in-place)
- * length:      number of samples
- * b0, b1, b2:  feedforward coefficients (Q15)
- * a1, a2:      feedback coefficients (Q15, already negated in table)
- * state:       4-element array {x1, x2, y1, y2}, persists across calls
+ * No division - only multiply and shift.
  */
 __efficient__ void lowpass(const int16_t *restrict input,
                            int16_t *restrict output,

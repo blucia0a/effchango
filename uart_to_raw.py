@@ -2,9 +2,14 @@
 """
 Extract chango audio from UART output and write raw PCM to stdout.
 
-Reads UART log from stdin (or a file argument), finds the
-CHANGO_AUDIO_START / CHANGO_AUDIO_END markers, decodes the decimal
-samples, and writes 16-bit signed little-endian PCM to stdout.
+Reads UART log from stdin (or a file argument), decodes decimal
+sample values, and writes 16-bit signed little-endian PCM to stdout.
+
+Robust to lost UART data: if CHANGO_AUDIO_START/END markers are
+missing, any line that is a bare integer is treated as a sample.
+
+Processes lines incrementally so it works with streaming input
+(e.g., cat /dev/ttyUSB0).
 
 Usage:
     # From a saved UART log:
@@ -28,39 +33,58 @@ def main():
     else:
         inp = sys.stdin
 
-    in_audio = False
-    sample_rate = 0
+    sample_rate = 8000  # default if START marker is lost
     count = 0
+    buf = []
 
-    for line in inp:
+    # Flush every 256 samples (~32ms at 8kHz) to balance latency vs choppiness
+    FLUSH_SAMPLES = 4096 
+
+    while True:
+        line = inp.readline()
+        if not line:
+            break
         line = line.strip()
+        if not line:
+            continue
 
         if line.startswith("CHANGO_AUDIO_START"):
             parts = line.split()
             if len(parts) >= 2:
                 sample_rate = int(parts[1])
-            in_audio = True
             print(f"[uart_to_raw] Receiving audio at {sample_rate} Hz...",
-                  file=sys.stderr)
+                  file=sys.stderr, flush=True)
             continue
 
         if line == "CHANGO_AUDIO_END":
-            in_audio = False
+            duration = f"{count / sample_rate:.1f}s" if sample_rate else "?s"
             print(f"[uart_to_raw] Done: {count} samples "
-                  f"({count / sample_rate:.1f}s at {sample_rate} Hz)",
-                  file=sys.stderr)
+                  f"({duration} at {sample_rate} Hz)",
+                  file=sys.stderr, flush=True)
             continue
 
-        if in_audio:
-            try:
-                val = int(line)
-                # Clamp to int16 range
-                val = max(-32768, min(32767, val))
-                sys.stdout.buffer.write(struct.pack("<h", val))
+        # Try to parse any line as a sample — robust to missing markers
+        try:
+            val = int(line)
+            if -32768 <= val <= 32767:
+                buf.append(struct.pack("<h", val))
                 count += 1
-            except ValueError:
-                # Skip non-numeric lines (other printf output)
-                pass
+                if len(buf) >= FLUSH_SAMPLES:
+                    sys.stdout.buffer.write(b"".join(buf))
+                    sys.stdout.buffer.flush()
+                    buf.clear()
+        except ValueError:
+            pass
+
+    # Flush remaining samples
+    if buf:
+        sys.stdout.buffer.write(b"".join(buf))
+        sys.stdout.buffer.flush()
+
+    if count > 0 and sample_rate > 0:
+        print(f"[uart_to_raw] Total: {count} samples "
+              f"({count / sample_rate:.1f}s at {sample_rate} Hz)",
+              file=sys.stderr, flush=True)
 
     if inp is not sys.stdin:
         inp.close()

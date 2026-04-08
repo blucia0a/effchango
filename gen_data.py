@@ -36,9 +36,9 @@ SINE_TABLE_SIZE = 256
 NUM_GRID_X = 10
 NUM_GRID_Y = 10
 NUM_TONES = NUM_GRID_X * NUM_GRID_Y
-IMG_WIDTH = 100
-IMG_HEIGHT = 100
-NUM_AUDIO_SAMPLES = 16000  # 2 seconds at 8000 Hz
+IMG_WIDTH = 40
+IMG_HEIGHT = 40
+NUM_AUDIO_SAMPLES = 80000  # 10 seconds at 8000 Hz
 
 # Low-pass filter coefficient table dimensions
 NUM_LPF_CUTOFFS = 16     # log-spaced from 200 Hz to 3800 Hz

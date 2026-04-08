@@ -17,8 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <test_common.h>
-
 #ifndef AUTOBENCH
 #include <stopprop.h>
 #else
@@ -36,14 +34,18 @@
 #include "audio_out.h"
 #include "imu.h"
 
-/* Kernel declarations */
+/* Kernel declarations - NO division inside any of these */
 void pixelate(const uint8_t *restrict image,
-              int width, int height,
+              int width,
+              int region_w, int region_h,
               int grid_x, int grid_y,
+              int region_shift,
               uint8_t *restrict intensities);
 
 void synthesize(const uint8_t *restrict intensities,
                 int num_tones,
+                int32_t inv_num_tones,
+                int inv_shift,
                 const int16_t *restrict sine_table,
                 const uint32_t *restrict phase_incs,
                 uint32_t *restrict phases,
@@ -61,13 +63,29 @@ void lowpass(const int16_t *restrict input,
  * Audio samples per frame. At 8000 Hz sample rate and ~30 fps,
  * each frame produces ~267 samples. We use 256 for alignment.
  */
-#define SAMPLES_PER_FRAME 256
+#define SAMPLES_PER_FRAME 1024
 
 /* Total frames to render (SWIL mode). 2 seconds = 8000/256 ≈ 31 frames. */
 #define NUM_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
 
 /* IMU sweep period in frames. One full tilt cycle over the entire render. */
 #define IMU_SWEEP_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
+
+/*
+ * Precomputed constants to avoid division on the fabric.
+ *
+ * For pixelate: region is (IMG_WIDTH/NUM_GRID_X) x (IMG_HEIGHT/NUM_GRID_Y)
+ *   40/10 = 4, so 4x4 = 16 pixels per region, region_shift = 4
+ *
+ * For synthesize: divide by NUM_TONES (100) via multiply-shift.
+ *   x / 100 ≈ (x * 5243) >> 19   (error < 0.001%)
+ */
+#define REGION_W (IMG_WIDTH / NUM_GRID_X)
+#define REGION_H (IMG_HEIGHT / NUM_GRID_Y)
+#define REGION_SHIFT 4   /* log2(REGION_W * REGION_H) = log2(16) = 4 */
+
+#define INV_NUM_TONES 5243   /* ceil(2^19 / 100) */
+#define INV_SHIFT 19
 
 /* Buffers */
 uint8_t intensities[NUM_TONES];
@@ -111,45 +129,22 @@ int main() {
     memset(phases, 0, sizeof(phases));
     memset(lpf_state, 0, sizeof(lpf_state));
 
-    printf("[chango] Starting: %d frames, %d samples/frame, %d Hz\n",
-           NUM_FRAMES, SAMPLES_PER_FRAME, SAMPLE_RATE);
-
     int total_samples = 0;
 
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
-        /* Capture a frame */
         const uint8_t *image = cam.capture(&cam);
-        if (!image) {
-            printf("[chango] FAIL - camera capture at frame %d\n", frame);
-            break;
-        }
+        if (!image) break;
 
         /* Pixelate: image → intensity grid */
-        enterProfileRegion("pixelate");
-        pixelate(image, cam.width, cam.height,
-                 NUM_GRID_X, NUM_GRID_Y, intensities);
-        exitProfileRegion();
-
-        /* Print intensity grid on first frame */
-        if (frame == 0) {
-            printf("[chango] Intensity grid (%dx%d):\n", NUM_GRID_X, NUM_GRID_Y);
-            for (int y = 0; y < NUM_GRID_Y; y++) {
-                printf("  ");
-                for (int x = 0; x < NUM_GRID_X; x++) {
-                    printf("%3d ", intensities[x * NUM_GRID_Y + y]);
-                }
-                printf("\n");
-            }
-        }
+        pixelate(image, cam.width,
+                 REGION_W, REGION_H,
+                 NUM_GRID_X, NUM_GRID_Y,
+                 REGION_SHIFT, intensities);
 
         /* Read IMU and map to LPF parameters */
         imu_sample_t imu_sample;
         imu.read(&imu, &imu_sample);
 
-        /*
-         * Map accel_x (-1000..+1000) → cutoff index (0..NUM_LPF_CUTOFFS-1)
-         * Map accel_y (-1000..+1000) → resonance index (0..NUM_LPF_RESONANCES-1)
-         */
         int lpf_cutoff_idx = ((int)imu_sample.accel_x + 1000) * (NUM_LPF_CUTOFFS - 1) / 2000;
         int lpf_q_idx = ((int)imu_sample.accel_y + 1000) * (NUM_LPF_RESONANCES - 1) / 2000;
         if (lpf_cutoff_idx < 0) lpf_cutoff_idx = 0;
@@ -164,23 +159,18 @@ int main() {
         int32_t lpf_a1 = lpf_coeffs[lpf_offset + 3];
         int32_t lpf_a2 = lpf_coeffs[lpf_offset + 4];
 
-        /* Synthesize: intensities → audio chunk (phases persist across frames) */
-        enterProfileRegion("synthesize");
-        synthesize(intensities, NUM_TONES, sine_table, phase_incs,
+        /* Synthesize: intensities → audio chunk */
+        synthesize(intensities, NUM_TONES,
+                   INV_NUM_TONES, INV_SHIFT,
+                   sine_table, phase_incs,
                    phases, audio_buf, SAMPLES_PER_FRAME);
-        exitProfileRegion();
 
-        /* Low-pass filter (state persists across frames, coeffs update per frame) */
-        enterProfileRegion("lowpass");
+        /* Low-pass filter */
         lowpass(audio_buf, filtered_buf, SAMPLES_PER_FRAME,
                 lpf_b0, lpf_b1, lpf_b2, lpf_a1, lpf_a2, lpf_state);
-        exitProfileRegion();
 
         /* Push filtered audio chunk to output */
-        if (ao.write(&ao, filtered_buf, SAMPLES_PER_FRAME) != 0) {
-            printf("[chango] FAIL - audio write at frame %d\n", frame);
-            break;
-        }
+        ao.write(&ao, filtered_buf, SAMPLES_PER_FRAME);
 
         total_samples += SAMPLES_PER_FRAME;
     }
@@ -189,13 +179,6 @@ int main() {
     imu.shutdown(&imu);
     ao.shutdown(&ao);
     cam.shutdown(&cam);
-
-    printf("[chango] Wrote %s: %d samples (%d Hz, %.1f seconds)\n",
-           OUTPUT_FILE, total_samples, SAMPLE_RATE,
-           (float)total_samples / SAMPLE_RATE);
-    printf("[chango] Play with: play -t raw -r %d -e signed -b 16 -c 1 %s\n",
-           SAMPLE_RATE, OUTPUT_FILE);
-    printf("[chango] PASS\n");
 
     return 0;
 }

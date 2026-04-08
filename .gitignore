@@ -4,3 +4,6 @@ chango_fabric
 chango_output.raw
 chango_data.h.inc
 chango_stderr.txt
+chango_fabric.hex
+sdk_build/
+pnrviz/
