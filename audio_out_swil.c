@@ -1,11 +1,13 @@
 /*
  * audio_out_swil.c - Software-in-the-loop audio output over UART
  *
- * Sends raw int16 little-endian PCM bytes directly to UART.
- * No text framing — the byte stream IS the audio.
+ * Sends unsigned 8-bit PCM (1 byte per sample) directly to UART.
+ * Converts int16 → uint8 by taking the high byte and adding 128.
+ * 1 byte/sample at 115200 baud = 11520 samples/sec > 8kHz.
  *
  * On hardware:
- *   cat /dev/ttyUSB0 | play -t raw -r 8000 -e signed -b 16 -c 1 -
+ *   sudo stty -F /dev/ttyUSB0 115200 raw -echo
+ *   cat /dev/ttyUSB0 | play -t raw -r 8000 -e unsigned -b 8 -c 1 -
  */
 
 #include <stdio.h>
@@ -28,15 +30,16 @@ static audio_out_swil_ctx_t swil_ctx;
 static int swil_init(audio_out_t *ao) {
     audio_out_swil_ctx_t *ctx = (audio_out_swil_ctx_t *)ao->ctx;
     ctx->total_samples = 0;
+
     return 0;
 }
 
 static int swil_write(audio_out_t *ao, const int16_t *samples, int num_samples) {
     audio_out_swil_ctx_t *ctx = (audio_out_swil_ctx_t *)ao->ctx;
     for (int i = 0; i < num_samples; i++) {
-        uint16_t val = (uint16_t)samples[i];
-        UART_BYTE(val & 0xFF);
-        UART_BYTE((val >> 8) & 0xFF);
+        /* Convert signed 16-bit → unsigned 8-bit: take high byte + 128 */
+        uint8_t val = (uint8_t)((samples[i] >> 8) + 128);
+        UART_BYTE(val);
     }
     ctx->total_samples += num_samples;
     return 0;
