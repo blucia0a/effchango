@@ -16,13 +16,13 @@ Original repos for reference:
 ### Pipeline (runs as a frame loop in main.c)
 
 ```
-camera.capture() → pixelate() → synthesize() → lowpass() → audio_out.write()
-                                      ↑                ↑
-                                 sine table       IMU controls
-                                 phase incs       cutoff/resonance
+camera.capture(320x240) → scale_image(256x256) → pixelate(4x4) → synthesize(16 tones) → lowpass() → audio_out.write()
+                                                                        ↑                     ↑
+                                                                   sine table            IMU controls
+                                                                   phase incs            cutoff/resonance
 ```
 
-Each frame: capture a 40x40 image, divide into 5x5 grid (8x8 pixel regions), compute average intensity per region, generate 512 audio samples (one tone per region, amplitude = intensity), apply biquad low-pass filter, send to UART as 8-bit PCM.
+Each frame: capture a QVGA image (320×240), nearest-neighbor scale to 256×256, divide into 4×4 grid (64×64 pixel regions), compute average intensity per region, generate 512 audio samples (one tone per region, amplitude = intensity), apply biquad low-pass filter, send to UART as 8-bit unsigned PCM.
 
 ### Key design constraints
 
@@ -35,7 +35,7 @@ Each frame: capture a 40x40 image, divide into 5x5 grid (8x8 pixel regions), com
 
 | File | Role |
 |------|------|
-| `chango.c` | `__efficient__` kernels: `pixelate()`, `synthesize()`, `lowpass()` |
+| `chango.c` | `__efficient__` kernels: `scale_image()`, `pixelate()`, `synthesize()`, `lowpass()` |
 | `main.c` | Frame loop wiring all the pieces together |
 | `camera.h` / `camera_swil.c` | Camera interface + SWIL (returns embedded test image) |
 | `audio_out.h` / `audio_out_swil.c` | Audio output interface + SWIL (raw 8-bit PCM bytes over UART) |
@@ -47,9 +47,9 @@ Each frame: capture a 40x40 image, divide into 5x5 grid (8x8 pixel regions), com
 
 ### Generated data (`chango_data.h.inc`, via `gen_data.py`)
 
-- 40x40 grayscale test image (synthetic gradient + circle pattern)
+- 320×240 QVGA grayscale test image (synthetic gradient + circle pattern)
 - 256-entry Q15 sine lookup table
-- 25 phase increments (one per tone, for 5x5 grid)
+- 16 phase increments (one per tone, for 4×4 grid)
 - Biquad LPF coefficient table: 16 cutoff frequencies (200-3800 Hz, log-spaced) × 8 Q values (0.5-8.0, log-spaced) × 5 coefficients (b0, b1, b2, a1, a2) in Q15
 
 ### Audio format
@@ -142,17 +142,31 @@ The IMU SWIL generates a triangle wave on `accel_x` (one cycle over the full ren
 
 Coefficients are looked up from the precomputed table each frame. This produces an audible filter sweep in the output.
 
+## Image scaling
+
+`scale_image()` performs nearest-neighbor resize from camera resolution to 256×256 using multiply-shift (no division):
+- `input_y = oy * src_h >> 8`
+- `input_x = ox * src_w >> 8`
+
+Source dimensions (`SRC_WIDTH`, `SRC_HEIGHT`) are defined in gen_data.py and emitted to the header. The scaled image is always 256×256 (`IMG_WIDTH × IMG_HEIGHT`).
+
+To support a different camera resolution, just change `SRC_WIDTH`/`SRC_HEIGHT` in gen_data.py. The scaler handles any source size.
+
 ## Precomputed constants in main.c
 
 These avoid division on the fabric and must be updated if the grid or image size changes:
 
 ```
-REGION_W = IMG_WIDTH / NUM_GRID_X     (currently 40/5 = 8)
-REGION_H = IMG_HEIGHT / NUM_GRID_Y    (currently 40/5 = 8)
-REGION_SHIFT = log2(REGION_W * REGION_H) = log2(64) = 6
-INV_NUM_TONES = ceil(2^15 / NUM_TONES) = ceil(32768/25) = 1311
-INV_SHIFT = 15
+REGION_W = IMG_WIDTH / NUM_GRID_X     (currently 256/4 = 64)
+REGION_H = IMG_HEIGHT / NUM_GRID_Y    (currently 256/4 = 64)
+REGION_SHIFT = log2(REGION_W * REGION_H) = log2(4096) = 12
+INV_NUM_TONES = 1    (16 is power of 2, pure shift)
+INV_SHIFT = 4        (log2(16) = 4)
 ```
+
+Power-of-2 grid options on 256×256:
+- 4×4 = 16 tones, 64×64 regions, region_shift=12, inv_shift=4
+- 8×8 = 64 tones, 32×32 regions, region_shift=10, inv_shift=6
 
 ## Future work
 
