@@ -79,7 +79,7 @@ chango_sim: $(SOURCES) $(DATA) $(HEADERS)
 # Fabric build (for actual E1x hardware, links SDK for UART3 printf)
 fabric: chango_fabric
 
-FAB_FLAGS = -c $(CFLAGS) -DEFF_ARCH_E1X $(STDIO_OPTS) -flto --target=e1x
+FAB_FLAGS = -c $(CFLAGS) -DEFF_ARCH_E1X $(STDIO_OPTS) -flto --target=e1x 
 
 chango_fabric: $(SOURCES) $(DATA) $(HEADERS) $(LIBEFF)
 	$(EFFCC) $(FAB_FLAGS) -o chango.fab.o chango.c

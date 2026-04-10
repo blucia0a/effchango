@@ -13,9 +13,36 @@
  */
 
 #include <stdint.h>
+#include <eff.h>
 
 #define FRAC_BITS 15
 #define FIXED_ROUND(x) (((x) + (1 << (FRAC_BITS - 1))) >> FRAC_BITS)
+
+/*
+ * scale_image: Nearest-neighbor scale from arbitrary size to 256x256.
+ *
+ * Uses multiply-shift instead of division:
+ *   input_y = oy * src_h >> 8
+ *   input_x = ox * src_w >> 8
+ *
+ * src:    source image (row-major grayscale, src_w × src_h)
+ * src_w:  source width (e.g., 320 for QVGA)
+ * src_h:  source height (e.g., 240 for QVGA)
+ * dst:    destination buffer (256 × 256 = 65536 bytes)
+ */
+__efficient__ void scale_image(const uint8_t *restrict src,
+                               int src_w, int src_h,
+                               uint8_t *restrict dst) {
+    __effcc_parallel(8){
+    for (int oy = 0; oy < 256; oy++) {
+        int iy = (oy * src_h) >> 8;
+        for (int ox = 0; ox < 256; ox++) {
+            int ix = (ox * src_w) >> 8;
+            dst[oy * 256 + ox] = src[iy * src_w + ix];
+        }
+    }
+    }
+}
 
 /*
  * pixelate: Divide image into grid regions and compute average intensity.
@@ -38,6 +65,8 @@ __efficient__ void pixelate(const uint8_t *restrict image,
                             int grid_x, int grid_y,
                             int region_shift,
                             uint8_t *restrict intensities) {
+    __effcc_ignore_memory_order{
+    __effcc_parallel(8){
     for (int ry = 0; ry < grid_y; ry++) {
         for (int rx = 0; rx < grid_x; rx++) {
             uint32_t sum = 0;
@@ -45,20 +74,15 @@ __efficient__ void pixelate(const uint8_t *restrict image,
             int x_start = rx * region_w;
 
             for (int y = y_start; y < y_start + region_h; y++) {
-                /* Row pointer avoids recomputing y*width each pixel */
-                const uint8_t *row = &image[y * width + x_start];
-
-                /* Unrolled by 4 — region_w (8) is a multiple of 4 */
-                for (int x = 0; x < region_w; x += 4) {
-                    sum += row[x + 0];
-                    sum += row[x + 1];
-                    sum += row[x + 2];
-                    sum += row[x + 3];
+                for (int x = x_start; x < x_start + region_w; x++) {
+                    sum += image[y * width + x];
                 }
             }
 
             intensities[rx * grid_y + ry] = (uint8_t)(sum >> region_shift);
         }
+    }
+    }
     }
 }
 
@@ -91,6 +115,7 @@ __efficient__ void synthesize(const uint8_t *restrict intensities,
     for (int s = 0; s < num_samples; s++) {
         int32_t mix = 0;
 
+        __effcc_parallel(4){
         for (int t = 0; t < num_tones; t++) {
             /* Look up sine value using top 8 bits of phase as table index */
             uint8_t idx = (uint8_t)(phases[t] >> 24);
@@ -104,8 +129,11 @@ __efficient__ void synthesize(const uint8_t *restrict intensities,
             /* Advance phase */
             phases[t] += phase_incs[t];
         }
+        }
 
-        /* Average across all tones: x / 25 ≈ (x * 1311) >> 15 */
+        /* Average across all tones. When num_tones is a power of 2,
+         * inv_num_tones=1 and inv_shift=log2(num_tones), so this is
+         * just a right shift. */
         mix = (mix * inv_num_tones) >> inv_shift;
 
         /* Clamp to int16_t range */

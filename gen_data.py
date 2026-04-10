@@ -9,26 +9,28 @@ import os
 # Musical note frequencies (Hz) - pentatonic-ish spread across octaves
 # Matches the spirit of the original PhotoChango tones
 TONE_FREQS = [
-    # 5x5 grid - pentatonic spread across octaves (25 tones)
+    # 4x4 grid - pentatonic spread across octaves (16 tones)
     # Row 0 (bottom)
-    130.81, 196.00, 261.63, 349.23, 440.00,
+    130.81, 196.00, 261.63, 392.00,
     # Row 1
-    196.00, 261.63, 392.00, 523.25, 659.26,
+    261.63, 392.00, 523.25, 783.99,
     # Row 2
-    261.63, 392.00, 523.25, 783.99, 987.77,
-    # Row 3
-    392.00, 523.25, 783.99, 1046.50, 1567.98,
-    # Row 4 (top)
-    523.25, 783.99, 1046.50, 1567.98, 2093.00,
+    392.00, 523.25, 783.99, 1046.50,
+    # Row 3 (top)
+    523.25, 783.99, 1046.50, 1567.98,
 ]
 
 SAMPLE_RATE = 8000
 SINE_TABLE_SIZE = 256
-NUM_GRID_X = 5
-NUM_GRID_Y = 5
+NUM_GRID_X = 4
+NUM_GRID_Y = 4
 NUM_TONES = NUM_GRID_X * NUM_GRID_Y
-IMG_WIDTH = 40
-IMG_HEIGHT = 40
+# Scaled image size (scale_image outputs 256x256 regardless of camera input)
+IMG_WIDTH = 256
+IMG_HEIGHT = 256
+# Source camera resolution (for scale_image input)
+SRC_WIDTH = 320
+SRC_HEIGHT = 240
 NUM_AUDIO_SAMPLES = 80000  # 10 seconds at 8000 Hz
 
 # Low-pass filter coefficient table dimensions
@@ -68,26 +70,26 @@ def compute_phase_increments():
 
 
 def generate_test_image():
-    """Generate a synthetic 100x100 grayscale test image.
+    """Generate a synthetic grayscale test image at source resolution.
 
     Creates a pattern with varying brightness regions to produce
     interesting audio output - diagonal gradient with some circular features.
     """
     pixels = []
-    cx, cy = IMG_WIDTH // 2, IMG_HEIGHT // 2
-    for y in range(IMG_HEIGHT):
-        for x in range(IMG_WIDTH):
+    cx, cy = SRC_WIDTH // 2, SRC_HEIGHT // 2
+    for y in range(SRC_HEIGHT):
+        for x in range(SRC_WIDTH):
             # Base: diagonal gradient
-            base = int((x + y) * 255 / (IMG_WIDTH + IMG_HEIGHT - 2))
+            base = int((x + y) * 255 / (SRC_WIDTH + SRC_HEIGHT - 2))
 
             # Add circular bright spot
             dx = x - cx
             dy = y - cy
             dist = math.sqrt(dx * dx + dy * dy)
-            circle = max(0, int(200 * (1.0 - dist / (IMG_WIDTH * 0.4))))
+            circle = max(0, int(200 * (1.0 - dist / (SRC_WIDTH * 0.4))))
 
             # Add some grid-like variation
-            grid = 50 if ((x // 20) + (y // 20)) % 2 == 0 else 0
+            grid = 50 if ((x // 40) + (y // 40)) % 2 == 0 else 0
 
             val = min(255, base + circle + grid)
             pixels.append(val)
@@ -187,6 +189,8 @@ def main():
         f.write("#include <stdint.h>\n\n")
 
         # Image dimensions
+        f.write(f"#define SRC_WIDTH {SRC_WIDTH}\n")
+        f.write(f"#define SRC_HEIGHT {SRC_HEIGHT}\n")
         f.write(f"#define IMG_WIDTH {IMG_WIDTH}\n")
         f.write(f"#define IMG_HEIGHT {IMG_HEIGHT}\n")
         f.write(f"#define NUM_GRID_X {NUM_GRID_X}\n")
@@ -203,8 +207,8 @@ def main():
 
         f.write(f"#ifdef DEFINE_CHANGO_DATA\n\n")
 
-        # Test image (grayscale, 0-255)
-        f.write(f"const uint8_t test_image[{IMG_WIDTH * IMG_HEIGHT}] = {{\n    ")
+        # Test image at source resolution (grayscale, 0-255)
+        f.write(f"const uint8_t test_image[{SRC_WIDTH * SRC_HEIGHT}] = {{\n    ")
         write_array(f, test_image, "uint8_t", per_line=20)
         f.write("\n};\n\n")
 
@@ -236,7 +240,7 @@ def main():
         f.write("#endif /* DEFINE_CHANGO_DATA */\n")
 
     print(f"Generated {args.output}")
-    print(f"  Image: {IMG_WIDTH}x{IMG_HEIGHT} grayscale")
+    print(f"  Source: {SRC_WIDTH}x{SRC_HEIGHT} → scaled to {IMG_WIDTH}x{IMG_HEIGHT}")
     print(f"  Tones: {NUM_TONES} ({NUM_GRID_X}x{NUM_GRID_Y} grid)")
     print(f"  Sine table: {SINE_TABLE_SIZE} entries (Q15)")
     print(f"  LPF table: {NUM_LPF_CUTOFFS} cutoffs x {NUM_LPF_RESONANCES} Q values")

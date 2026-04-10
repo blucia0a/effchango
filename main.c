@@ -2,14 +2,11 @@
  * main.c - Efficient E1x Chango main loop
  *
  * Runs the chango pipeline in a frame loop:
- *   camera.capture() → pixelate() → synthesize() → audio_out.write()
+ *   camera.capture() → scale_image() → pixelate() → synthesize() →
+ *   lowpass() → audio_out.write()
  *
- * Camera and audio output are abstracted behind interfaces (camera.h,
- * audio_out.h) so hardware drivers can be swapped in later. Currently
- * uses software-in-the-loop implementations (test image + file output).
- *
- * Play output with:
- *   play -t raw -r 8000 -e signed -b 16 -c 1 chango_output.raw
+ * Camera captures at source resolution (e.g., 320x240 QVGA), then
+ * scale_image() resizes to 256x256 for power-of-2 grid processing.
  */
 
 #include <stdint.h>
@@ -35,6 +32,10 @@
 #include "imu.h"
 
 /* Kernel declarations - NO division inside any of these */
+void scale_image(const uint8_t *restrict src,
+                 int src_w, int src_h,
+                 uint8_t *restrict dst);
+
 void pixelate(const uint8_t *restrict image,
               int width,
               int region_w, int region_h,
@@ -59,13 +60,9 @@ void lowpass(const int16_t *restrict input,
              int32_t a1, int32_t a2,
              int32_t *restrict state);
 
-/*
- * Audio samples per frame. At 8000 Hz sample rate and ~30 fps,
- * each frame produces ~267 samples. We use 256 for alignment.
- */
 #define SAMPLES_PER_FRAME 512
 
-/* Total frames to render (SWIL mode). 2 seconds = 8000/256 ≈ 31 frames. */
+/* Total frames to render (SWIL mode). */
 #define NUM_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
 
 /* IMU sweep period in frames. One full tilt cycle over the entire render. */
@@ -74,20 +71,18 @@ void lowpass(const int16_t *restrict input,
 /*
  * Precomputed constants to avoid division on the fabric.
  *
- * For pixelate: region is (IMG_WIDTH/NUM_GRID_X) x (IMG_HEIGHT/NUM_GRID_Y)
- *   40/5 = 8, so 8x8 = 64 pixels per region, region_shift = 6
- *
- * For synthesize: divide by NUM_TONES (25) via multiply-shift.
- *   x / 25 ≈ (x * 1311) >> 15
+ * For pixelate: 256x256 image / 4x4 grid = 64x64 regions = 4096 pixels
+ * For synthesize: 16 tones is a power of 2 → pure shift
  */
-#define REGION_W (IMG_WIDTH / NUM_GRID_X)
-#define REGION_H (IMG_HEIGHT / NUM_GRID_Y)
-#define REGION_SHIFT 6   /* log2(REGION_W * REGION_H) = log2(64) = 6 */
+#define REGION_W (IMG_WIDTH / NUM_GRID_X)   /* 64 */
+#define REGION_H (IMG_HEIGHT / NUM_GRID_Y)  /* 64 */
+#define REGION_SHIFT 12  /* log2(64 * 64) = log2(4096) = 12 */
 
-#define INV_NUM_TONES 1311   /* ceil(2^15 / 25) */
-#define INV_SHIFT 15
+#define INV_NUM_TONES 1  /* 16 is power of 2, so just shift */
+#define INV_SHIFT 4      /* log2(16) = 4 */
 
 /* Buffers */
+uint8_t scaled_image[256 * 256];  /* output of scale_image */
 uint8_t intensities[NUM_TONES];
 uint32_t phases[NUM_TONES];
 int16_t audio_buf[SAMPLES_PER_FRAME];
@@ -98,17 +93,17 @@ int32_t lpf_state[4]; /* {x1, x2, y1, y2} */
 
 int main() {
     /* Prevent constant propagation of inputs */
-    stop_propagation_u8((uint8_t *)test_image, IMG_WIDTH * IMG_HEIGHT);
+    stop_propagation_u8((uint8_t *)test_image, SRC_WIDTH * SRC_HEIGHT);
     stop_propagation_i16((int16_t *)sine_table, SINE_TABLE_SIZE);
 
-    /* Set up camera (software-in-the-loop: returns test image) */
-    camera_t cam = camera_swil_create(test_image, IMG_WIDTH, IMG_HEIGHT);
+    /* Set up camera (SWIL: returns test image at source resolution) */
+    camera_t cam = camera_swil_create(test_image, SRC_WIDTH, SRC_HEIGHT);
     if (cam.init(&cam) != 0) {
         printf("[chango] FAIL - camera init\n");
         return 1;
     }
 
-    /* Set up audio output (software-in-the-loop: prints over UART) */
+    /* Set up audio output (SWIL: raw binary bytes over UART) */
     audio_out_t ao = audio_out_swil_create(OUTPUT_FILE, SAMPLE_RATE);
     if (ao.init(&ao) != 0) {
         printf("[chango] FAIL - audio output init\n");
@@ -116,7 +111,7 @@ int main() {
         return 1;
     }
 
-    /* Set up IMU (software-in-the-loop: synthetic sweep) */
+    /* Set up IMU (SWIL: synthetic sweep) */
     imu_t imu = imu_swil_create(IMU_SWEEP_FRAMES);
     if (imu.init(&imu) != 0) {
         printf("[chango] FAIL - imu init\n");
@@ -135,8 +130,11 @@ int main() {
         const uint8_t *image = cam.capture(&cam);
         if (!image) break;
 
-        /* Pixelate: image → intensity grid */
-        pixelate(image, cam.width,
+        /* Scale source image (e.g., 320x240) → 256x256 */
+        scale_image(image, cam.width, cam.height, scaled_image);
+
+        /* Pixelate: 256x256 image → 4x4 intensity grid */
+        pixelate(scaled_image, IMG_WIDTH,
                  REGION_W, REGION_H,
                  NUM_GRID_X, NUM_GRID_Y,
                  REGION_SHIFT, intensities);
