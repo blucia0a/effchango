@@ -31,6 +31,10 @@
 #include "audio_out.h"
 #include "imu.h"
 
+#if defined(EFF_ARCH_E1X) && !defined(SIM_BUILD)
+#include <eff.h>
+#endif
+
 /* Kernel declarations - NO division inside any of these */
 void scale_image(const uint8_t *restrict src,
                  int src_w, int src_h,
@@ -62,7 +66,7 @@ void lowpass(const int16_t *restrict input,
 
 #define SAMPLES_PER_FRAME 512
 
-/* Total frames to render (SWIL mode). */
+/* Total frames to render (SWIL mode). On hardware the loop runs forever. */
 #define NUM_FRAMES (NUM_AUDIO_SAMPLES / SAMPLES_PER_FRAME)
 
 /* IMU sweep period in frames. One full tilt cycle over the entire render. */
@@ -93,11 +97,16 @@ int32_t lpf_state[4]; /* {x1, x2, y1, y2} */
 
 int main() {
     /* Prevent constant propagation of inputs */
-    stop_propagation_u8((uint8_t *)test_image, SRC_WIDTH * SRC_HEIGHT);
     stop_propagation_i16((int16_t *)sine_table, SINE_TABLE_SIZE);
+#ifndef USE_HW_CAMERA
+    stop_propagation_u8((uint8_t *)test_image, SRC_WIDTH * SRC_HEIGHT);
+#endif
 
-    /* Set up camera (SWIL: returns test image at source resolution) */
+#ifdef USE_HW_CAMERA
+    camera_t cam = camera_hm0360_create();
+#else
     camera_t cam = camera_swil_create(test_image, SRC_WIDTH, SRC_HEIGHT);
+#endif
     if (cam.init(&cam) != 0) {
         printf("[chango] FAIL - camera init\n");
         return 1;
@@ -124,20 +133,53 @@ int main() {
     memset(phases, 0, sizeof(phases));
     memset(lpf_state, 0, sizeof(lpf_state));
 
-    int total_samples = 0;
-
-    for (int frame = 0; frame < NUM_FRAMES; frame++) {
+#ifdef CAMERA_DEBUG
+    /*
+     * Diagnostic mode: stream raw camera frames over the same UART that
+     * normally carries audio, and synthesize nothing. Host side: view.py
+     * looking for the DEADBEEF SOF magic + cam.width * cam.height bytes.
+     */
+    const int frame_bytes = cam.width * cam.height;
+    for (;;) {
         const uint8_t *image = cam.capture(&cam);
-        if (!image) break;
+        if (!image) continue;   /* capture gave up; just try again */
 
-        /* Scale source image (e.g., 320x240) → 256x256 */
-        scale_image(image, cam.width, cam.height, scaled_image);
+        eff_uart_putc(STDIO_UART, 0xDE);
+        eff_uart_putc(STDIO_UART, 0xAD);
+        eff_uart_putc(STDIO_UART, 0xBE);
+        eff_uart_putc(STDIO_UART, 0xEF);
+        for (int i = 0; i < frame_bytes; i++) {
+            eff_uart_putc(STDIO_UART, image[i]);
+        }
+    }
+#else
 
-        /* Pixelate: 256x256 image → 4x4 intensity grid */
-        pixelate(scaled_image, IMG_WIDTH,
-                 REGION_W, REGION_H,
-                 NUM_GRID_X, NUM_GRID_Y,
-                 REGION_SHIFT, intensities);
+    /*
+     * On hardware the instrument plays until it is powered off. The SWIL build
+     * renders a fixed number of frames so its output stays reproducible.
+     */
+#ifdef USE_HW_CAMERA
+    for (;;) {
+#else
+    for (int frame = 0; frame < NUM_FRAMES; frame++) {
+#endif
+        const uint8_t *image = cam.capture(&cam);
+
+        /*
+         * A dropped frame must not gap the audio: keep the intensities from
+         * the last good capture and carry on synthesizing. On the very first
+         * frame they are still zero, which is silence.
+         */
+        if (image) {
+            /* Scale source image (e.g., 160x120) → 256x256 */
+            scale_image(image, cam.width, cam.height, scaled_image);
+
+            /* Pixelate: 256x256 image → 4x4 intensity grid */
+            pixelate(scaled_image, IMG_WIDTH,
+                     REGION_W, REGION_H,
+                     NUM_GRID_X, NUM_GRID_Y,
+                     REGION_SHIFT, intensities);
+        }
 
         /* Read IMU and map to LPF parameters */
         imu_sample_t imu_sample;
@@ -169,9 +211,8 @@ int main() {
 
         /* Push filtered audio chunk to output */
         ao.write(&ao, filtered_buf, SAMPLES_PER_FRAME);
-
-        total_samples += SAMPLES_PER_FRAME;
     }
+#endif /* CAMERA_DEBUG */
 
     /* Shut down */
     imu.shutdown(&imu);

@@ -7,3 +7,7 @@ chango_stderr.txt
 chango_fabric.hex
 sdk_build/
 pnrviz/
+venv/
+__pycache__/
+*.wav
+frames/

@@ -46,4 +46,10 @@ struct camera {
  */
 camera_t camera_swil_create(const uint8_t *test_image, int width, int height);
 
+/*
+ * There is deliberately no camera_t implementation for the HM0360. The
+ * hardware build uses main_hm0360.c, which keeps the reference bring-up and
+ * capture loop verbatim rather than reshaping it to fit this interface.
+ */
+
 #endif /* CAMERA_H */
